@@ -30,7 +30,7 @@ For more information, please refer to <http://unlicense.org/>
 
 #include "pigpio.h"
 
-#define PIGPIOD_IF2_VERSION 8
+#define PIGPIOD_IF2_VERSION 15
 
 /*TEXT
 
@@ -121,7 +121,7 @@ set_servo_pulsewidth       Start/stop servo pulses on a GPIO
 get_servo_pulsewidth       Get the servo pulsewidth in use on a GPIO
 
 callback                   Create GPIO level change callback
-callback_ex                Create GPIO level change callback
+callback_ex                Create GPIO level change callback, extended
 callback_cancel            Cancel a callback
 wait_for_edge              Wait for GPIO level change
 
@@ -178,6 +178,7 @@ SCRIPTS
 
 store_script               Store a script
 run_script                 Run a stored script
+update_script              Set a scripts parameters
 script_status              Get script status and parameters
 stop_script                Stop a running script
 delete_script              Delete a stored script
@@ -253,6 +254,15 @@ spi_read                   Reads bytes from a SPI device
 spi_write                  Writes bytes to a SPI device
 spi_xfer                   Transfers bytes with a SPI device
 
+bb_spi_open                Opens GPIO for bit banging SPI
+bb_spi_close               Closes GPIO for bit banging SPI
+bb_spi_xfer                Transfers bytes with bit banging SPI
+
+I2C/SPI_SLAVE
+
+bsc_xfer                   I2C/SPI as slave transfer
+bsc_i2c                    I2C as slave transfer
+
 SERIAL
 
 serial_open                Opens a serial device
@@ -273,6 +283,14 @@ file_read                  Reads bytes from a file
 file_write                 Writes bytes to a file
 file_seek                  Seeks to a position within a file
 file_list                  List files which match a pattern
+
+EVENTS
+
+event_callback            Sets a callback for an event
+event_callback_ex         Sets a callback for an event, extended
+event_callback_cancel     Cancel an event callback
+event_trigger             Triggers an event
+wait_for_event            Wait for an event
 
 CUSTOM
 
@@ -302,9 +320,17 @@ typedef void (*CBFunc_t)
    (int pi, unsigned user_gpio, unsigned level, uint32_t tick);
 
 typedef void (*CBFuncEx_t)
-   (int pi, unsigned user_gpio, unsigned level, uint32_t tick, void * user);
+   (int pi, unsigned user_gpio, unsigned level, uint32_t tick, void *userdata);
 
 typedef struct callback_s callback_t;
+
+typedef void (*evtCBFunc_t)
+   (int pi, unsigned event, uint32_t tick);
+
+typedef void (*evtCBFuncEx_t)
+   (int pi, unsigned event, uint32_t tick, void *userdata);
+
+typedef struct evtCallback_s evtCallback_t;
 
 /*F*/
 double time_time(void);
@@ -784,14 +810,18 @@ typedef struct
 seqno: starts at 0 each time the handle is opened and then increments
 by one for each report.
 
-flags: two flags are defined, PI_NTFY_FLAGS_WDOG and PI_NTFY_FLAGS_ALIVE.
+flags: three flags are defined, PI_NTFY_FLAGS_WDOG,
+PI_NTFY_FLAGS_ALIVE, and PI_NTFY_FLAGS_EVENT.
 
-PI_NTFY_FLAGS_WDOG, if bit 5 is set then bits 0-4 of the flags
+If bit 5 is set (PI_NTFY_FLAGS_WDOG) then bits 0-4 of the flags
 indicate a GPIO which has had a watchdog timeout.
 
-PI_NTFY_FLAGS_ALIVE, if bit 6 is set this indicates a keep alive
+If bit 6 is set (PI_NTFY_FLAGS_ALIVE) this indicates a keep alive
 signal on the pipe/socket and is sent once a minute in the absence
 of other notification activity.
+
+If bit 7 is set (PI_NTFY_FLAGS_EVENT) then bits 0-4 of the flags
+indicate an event which has been triggered.
 
 tick: the number of microseconds since system boot.  It wraps around
 after 1h12m.
@@ -850,12 +880,10 @@ Only one watchdog may be registered per GPIO.
 
 The watchdog may be cancelled by setting timeout to 0.
 
-If no level change has been detected for the GPIO for timeout
-milliseconds any notification for the GPIO has a report written
-to the fifo with the flags set to indicate a watchdog timeout.
+Once a watchdog has been started callbacks for the GPIO will be
+triggered every timeout interval after the last GPIO activity.
 
-The [*callback*] and [*callback_ex*] functions interpret the flags
-and will call registered callbacks for the GPIO with level TIMEOUT.
+The callback will receive the special level PI_TIMEOUT.
 D*/
 
 /*F*/
@@ -876,7 +904,13 @@ user_gpio: 0-31
 
 Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-Note, each (stable) edge will be timestamped [*steady*] microseconds
+This filter affects the GPIO samples returned to callbacks set up
+with [*callback*], [*callback_ex*] and [*wait_for_edge*].
+
+It does not affect levels read by [*gpio_read*],
+[*read_bank_1*], or [*read_bank_2*].
+
+Each (stable) edge will be timestamped [*steady*] microseconds
 after it was first detected.
 D*/
 
@@ -900,7 +934,13 @@ user_gpio: 0-31
 
 Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_BAD_FILTER.
 
-Note, level changes before and after the active period may
+This filter affects the GPIO samples returned to callbacks set up
+with [*callback*], [*callback_ex*] and [*wait_for_edge*].
+
+It does not affect levels read by [*gpio_read*],
+[*read_bank_1*], or [*read_bank_2*].
+
+Level changes before and after the active period may
 be reported.  Your software must be designed to cope with
 such reports.
 D*/
@@ -1009,7 +1049,7 @@ Frequencies above 30MHz are unlikely to work.
 . .
        pi: >=0 (as returned by [*pigpio_start*]).
      gpio: see description
-frequency: 0 (off) or 4689-250000000 (250M)
+frequency: 0 (off) or 4689-250M (13184-375M for the BCM2711)
 . .
 
 Returns 0 if OK, otherwise PI_NOT_PERMITTED, PI_BAD_GPIO,
@@ -1056,7 +1096,7 @@ daemon is started (option -t).
 . .
      pi: >=0 (as returned by [*pigpio_start*]).
    gpio: see descripton
-PWMfreq: 0 (off) or 1-125000000 (125M)
+PWMfreq: 0 (off) or 1-125M (1-187.5M for the BCM2711)
 PWMduty: 0 (off) to 1000000 (1M)(fully on)
 . .
 
@@ -1084,12 +1124,12 @@ The GPIO must be one of the following.
 . .
 
 The actual number of steps beween off and fully on is the
-integral part of 250 million divided by PWMfreq.
+integral part of 250M/PWMfreq (375M/PWMfreq for the BCM2711).
 
-The actual frequency set is 250 million / steps.
+The actual frequency set is 250M/steps (375M/steps for the BCM2711).
 
-There will only be a million steps for a PWMfreq of 250.
-Lower frequencies will have more steps and higher
+There will only be a million steps for a PWMfreq of 250 (375 for
+the BCM2711). Lower frequencies will have more steps and higher
 frequencies will have fewer steps.  PWMduty is
 automatically scaled to take this into account.
 D*/
@@ -1312,6 +1352,15 @@ wave_id: >=0, as returned by [*wave_create*].
 . .
 
 Wave ids are allocated in order, 0, 1, 2, etc.
+
+The wave is flagged for deletion.  The resources used by the wave
+will only be reused when either of the following apply.
+
+- all waves with higher numbered wave ids have been deleted or have
+been flagged for deletion.
+
+- a new wave is created which uses exactly the same resources as
+the current wave (see the C source for gpioWaveCreate for details).
 
 Returns 0 if OK, otherwise PI_BAD_WAVE_ID.
 D*/
@@ -1643,7 +1692,7 @@ int store_script(int pi, char *script);
 /*D
 This function stores a script for later execution.
 
-See [[http://abyz.co.uk/rpi/pigpio/pigs.html#Scripts]] for details.
+See [[http://abyz.me.uk/rpi/pigpio/pigs.html#Scripts]] for details.
 
 . .
     pi: >=0 (as returned by [*pigpio_start*]).
@@ -1668,6 +1717,27 @@ script_id: >=0, as returned by [*store_script*].
 
 The function returns 0 if OK, otherwise PI_BAD_SCRIPT_ID, or
 PI_TOO_MANY_PARAM
+
+param is an array of up to 10 parameters which may be referenced in
+the script as p0 to p9.
+D*/
+
+/*F*/
+int update_script(int pi, unsigned script_id, unsigned numPar, uint32_t *param);
+/*D
+This function sets the parameters of a script.  The script may or
+may not be running.  The first numPar parameters of the script are
+overwritten with the new values.
+
+. .
+       pi: >=0 (as returned by [*pigpio_start*]).
+script_id: >=0, as returned by [*store_script*].
+   numPar: 0-10, the number of parameters.
+    param: an array of parameters.
+. .
+
+The function returns 0 if OK, otherwise PI_BAD_SCRIPT_ID, or
+PI_TOO_MANY_PARAM.
 
 param is an array of up to 10 parameters which may be referenced in
 the script as p0 to p9.
@@ -1816,6 +1886,12 @@ No flags are currently defined.  This parameter should be set to zero.
 
 Physically buses 0 and 1 are available on the Pi.  Higher numbered buses
 will be available if a kernel supported bus multiplexor is being used.
+
+The GPIO used are given in the following table.
+
+      @ SDA @ SCL
+I2C 0 @  0  @  1
+I2C 1 @  2  @  3
 
 Returns a handle (>=0) if OK, otherwise PI_BAD_I2C_BUS, PI_BAD_I2C_ADDR,
 PI_BAD_FLAGS, PI_NO_HANDLE, or PI_I2C_OPEN_FAILED.
@@ -2372,21 +2448,186 @@ End
 D*/
 
 /*F*/
+int bb_spi_open(
+   int pi,
+   unsigned CS, unsigned MISO, unsigned MOSI, unsigned SCLK,
+   unsigned baud, unsigned spi_flags);
+/*D
+This function selects a set of GPIO for bit banging SPI at a
+specified baud rate.
+
+. .
+       pi: >=0 (as returned by [*pigpio_start*]).
+       CS: 0-31
+     MISO: 0-31
+     MOSI: 0-31
+     SCLK: 0-31
+     baud: 50-250000
+spi_flags: see below
+. .
+
+spi_flags consists of the least significant 22 bits.
+
+. .
+21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+ 0  0  0  0  0  0  R  T  0  0  0  0  0  0  0  0  0  0  0  p  m  m
+. .
+
+mm defines the SPI mode, defaults to 0
+
+. .
+Mode CPOL CPHA
+ 0    0    0
+ 1    0    1
+ 2    1    0
+ 3    1    1
+. .
+
+p is 0 if CS is active low (default) and 1 for active high.
+
+T is 1 if the least significant bit is transmitted on MOSI first, the
+default (0) shifts the most significant bit out first.
+
+R is 1 if the least significant bit is received on MISO first, the
+default (0) receives the most significant bit first.
+
+The other bits in flags should be set to zero.
+
+Returns 0 if OK, otherwise PI_BAD_USER_GPIO, PI_BAD_SPI_BAUD, or
+PI_GPIO_IN_USE.
+
+If more than one device is connected to the SPI bus (defined by
+SCLK, MOSI, and MISO) each must have its own CS.
+
+...
+bb_spi_open(pi,10, MISO, MOSI, SCLK, 10000, 0); // device 1
+bb_spi_open(pi,11, MISO, MOSI, SCLK, 20000, 3); // device 2
+...
+D*/
+
+/*F*/
+int bb_spi_close(int pi, unsigned CS);
+/*D
+This function stops bit banging SPI on a set of GPIO
+opened with [*bbSPIOpen*].
+
+. .
+pi: >=0 (as returned by [*pigpio_start*]).
+CS: 0-31, the CS GPIO used in a prior call to [*bb_spi_open*]
+. .
+
+Returns 0 if OK, otherwise PI_BAD_USER_GPIO, or PI_NOT_SPI_GPIO.
+D*/
+
+/*F*/
+int bb_spi_xfer(
+   int pi,
+   unsigned CS,
+   char    *txBuf,
+   char    *rxBuf,
+   unsigned count);
+/*D
+This function executes a bit banged SPI transfer.
+
+. .
+   pi: >=0 (as returned by [*pigpio_start*]).
+   CS: 0-31 (as used in a prior call to [*bb_spi_open*])
+txBuf: pointer to buffer to hold data to be sent
+rxBuf: pointer to buffer to hold returned data
+count: size of data transfer
+. .
+
+Returns >= 0 if OK (the number of bytes read), otherwise
+PI_BAD_USER_GPIO, PI_NOT_SPI_GPIO or PI_BAD_POINTER.
+
+...
+// gcc -Wall -pthread -o bb_spi_x_test bb_spi_x_test.c -lpigpiod_if2
+// ./bb_spi_x_test
+
+#include <stdio.h>
+
+#include "pigpiod_if2.h"
+
+#define CE0 5
+#define CE1 6
+#define MISO 13
+#define MOSI 19
+#define SCLK 12
+
+int main(int argc, char *argv[])
+{
+   int i, pi, count, set_val, read_val;
+   unsigned char inBuf[3];
+   char cmd1[] = {0, 0};
+   char cmd2[] = {12, 0};
+   char cmd3[] = {1, 128, 0};
+
+   if ((pi = pigpio_start(0, 0)) < 0)
+   {
+      fprintf(stderr, "pigpio initialisation failed (%d).\n", pi);
+      return 1;
+   }
+
+   bb_spi_open(pi, CE0, MISO, MOSI, SCLK, 10000, 0); // MCP4251 DAC
+   bb_spi_open(pi, CE1, MISO, MOSI, SCLK, 20000, 3); // MCP3008 ADC
+
+   for (i=0; i<256; i++)
+   {
+      cmd1[1] = i;
+
+      count = bb_spi_xfer(pi, CE0, cmd1, (char *)inBuf, 2); // > DAC
+
+      if (count == 2)
+      {
+         count = bb_spi_xfer(pi, CE0, cmd2, (char *)inBuf, 2); // < DAC
+
+         if (count == 2)
+         {
+            set_val = inBuf[1];
+
+            count = bb_spi_xfer(pi, CE1, cmd3, (char *)inBuf, 3); // < ADC
+
+            if (count == 3)
+            {
+               read_val = ((inBuf[1]&3)<<8) | inBuf[2];
+               printf("%d %d\n", set_val, read_val);
+            }
+         }
+      }
+   }
+
+   bb_spi_close(pi, CE0);
+   bb_spi_close(pi, CE1);
+
+   pigpio_stop(pi);
+}
+...
+D*/
+
+/*F*/
 int spi_open(int pi, unsigned spi_channel, unsigned baud, unsigned spi_flags);
 /*D
-This function returns a handle for the SPI device on channel.
+This function returns a handle for the SPI device on the channel.
 Data will be transferred at baud bits per second.  The flags may
 be used to modify the default behaviour of 4-wire operation, mode 0,
 active low chip select.
 
-An auxiliary SPI device is available on all models but the
-A and B and may be selected by setting the A bit in the
-flags.  The auxiliary device has 3 chip selects and a
-selectable word size in bits.
+The Pi has two SPI peripherals: main and auxiliary.
+
+The main SPI has two chip selects (channels), the auxiliary has
+three.
+
+The auxiliary SPI is available on all models but the A and B.
+
+The GPIO used are given in the following table.
+
+         @ MISO @ MOSI @ SCLK @ CE0 @ CE1 @ CE2
+Main SPI @    9 @   10 @   11 @   8 @   7 @   -
+Aux SPI  @   19 @   20 @   21 @  18 @  17 @  16
 
 . .
          pi: >=0 (as returned by [*pigpio_start*]).
-spi_channel: 0-1 (0-2 for the auxiliary device).
+spi_channel: 0-1 (0-2 for the auxiliary SPI).
        baud: 32K-125M (values above 30M are unlikely to work).
   spi_flags: see below.
 . .
@@ -2403,7 +2644,7 @@ spi_flags consists of the least significant 22 bits.
 
 mm defines the SPI mode.
 
-Warning: modes 1 and 3 do not appear to work on the auxiliary device.
+Warning: modes 1 and 3 do not appear to work on the auxiliary SPI.
 
 . .
 Mode POL PHA
@@ -2417,25 +2658,25 @@ px is 0 if CEx is active low (default) and 1 for active high.
 
 ux is 0 if the CEx GPIO is reserved for SPI (default) and 1 otherwise.
 
-A is 0 for the standard SPI device, 1 for the auxiliary SPI.
+A is 0 for the main SPI, 1 for the auxiliary SPI.
 
-W is 0 if the device is not 3-wire, 1 if the device is 3-wire.  Standard
-SPI device only.
+W is 0 if the device is not 3-wire, 1 if the device is 3-wire.  Main
+SPI only.
 
 nnnn defines the number of bytes (0-15) to write before switching
 the MOSI line to MISO to read data.  This field is ignored
-if W is not set.  Standard SPI device only.
+if W is not set.  Main SPI only.
 
 T is 1 if the least significant bit is transmitted on MOSI first, the
 default (0) shifts the most significant bit out first.  Auxiliary SPI
-device only.
+only.
 
 R is 1 if the least significant bit is received on MISO first, the
 default (0) receives the most significant bit first.  Auxiliary SPI
-device only.
+only.
 
 bbbbbb defines the word size in bits (0-32).  The default (0)
-sets 8 bits per word.  Auxiliary SPI device only.
+sets 8 bits per word.  Auxiliary SPI only.
 
 The [*spi_read*], [*spi_write*], and [*spi_xfer*] functions
 transfer data packed into 1, 2, or 4 bytes according to
@@ -2445,8 +2686,13 @@ For bits 1-8 there will be one byte per character.
 For bits 9-16 there will be two bytes per character. 
 For bits 17-32 there will be four bytes per character.
 
-E.g. to transfer 32 12-bit words buf should contain 64 bytes
+Multi-byte transfers are made in least significant byte first order.
+
+E.g. to transfer 32 11-bit words buf should contain 64 bytes
 and count should be 64.
+
+E.g. to transfer the 14 bit value 0x1ABC send the bytes 0xBC followed
+by 0x1A.
 
 The other bits in flags should be set to zero.
 D*/
@@ -2582,6 +2828,8 @@ handle: >=0, as returned by a call to [*serial_open*].
 
 Returns the read byte (>=0) if OK, otherwise PI_BAD_HANDLE,
 PI_SER_READ_NO_DATA, or PI_SER_READ_FAILED.
+
+If no data is ready PI_SER_READ_NO_DATA is returned.
 D*/
 
 /*F*/
@@ -2614,8 +2862,10 @@ handle: >=0, as returned by a call to [*serial_open*].
  count: the maximum number of bytes to read.
 . .
 
-Returns the number of bytes read (>0) if OK, otherwise PI_BAD_HANDLE,
+Returns the number of bytes read (>=0) if OK, otherwise PI_BAD_HANDLE,
 PI_BAD_PARAM, PI_SER_READ_NO_DATA, or PI_SER_WRITE_FAILED.
+
+If no data is ready zero is returned.
 D*/
 
 /*F*/
@@ -3057,6 +3307,20 @@ pigif_duplicate_callback, or pigif_bad_callback.
 
 The callback is called with the GPIO, edge, and tick, whenever the
 GPIO has the identified edge.
+
+. .
+Parameter   Value    Meaning
+
+GPIO        0-31     The GPIO which has changed state
+
+edge        0-2      0 = change to low (a falling edge)
+                     1 = change to high (a rising edge)
+                     2 = no level change (a watchdog timeout)
+
+tick        32 bit   The number of microseconds since boot
+                     WARNING: this wraps around from
+                     4294967295 to 0 roughly every 72 minutes
+. .
 D*/
 
 /*F*/
@@ -3076,8 +3340,24 @@ user_gpio: 0-31.
 The function returns a callback id if OK, otherwise pigif_bad_malloc,
 pigif_duplicate_callback, or pigif_bad_callback.
 
-The callback is called with the GPIO, edge, tick, and user, whenever
-the GPIO has the identified edge.
+The callback is called with the GPIO, edge, tick, and the userdata
+pointer, whenever the GPIO has the identified edge.
+
+. .
+Parameter   Value    Meaning
+
+GPIO        0-31     The GPIO which has changed state
+
+edge        0-2      0 = change to low (a falling edge)
+                     1 = change to high (a rising edge)
+                     2 = no level change (a watchdog timeout)
+
+tick        32 bit   The number of microseconds since boot
+                     WARNING: this wraps around from
+                     4294967295 to 0 roughly every 72 minutes
+
+userdata    pointer  Pointer to an arbitrary object
+. .
 D*/
 
 /*F*/
@@ -3095,7 +3375,7 @@ D*/
 /*F*/
 int wait_for_edge(int pi, unsigned user_gpio, unsigned edge, double timeout);
 /*D
-This function waits for edge on the GPIO for up to timeout
+This function waits for an edge on the GPIO for up to timeout
 seconds.
 
 . .
@@ -3113,6 +3393,264 @@ you need to know the accurate time of GPIO events use
 a [*callback*] function.
 
 The function returns 1 if the edge occurred, otherwise 0.
+D*/
+
+/*F*/
+int bsc_xfer(int pi, bsc_xfer_t *bscxfer);
+/*D
+This function provides a low-level interface to the
+SPI/I2C Slave peripheral.  This peripheral allows the
+Pi to act as a slave device on an I2C or SPI bus.
+
+This function is not available on the BCM2711 (e.g. as
+used in the Pi4B).
+
+I can't get SPI to work properly.  I tried with a
+control word of 0x303 and swapped MISO and MOSI.
+
+The function sets the BSC mode, writes any data in
+the transmit buffer to the BSC transmit FIFO, and
+copies any data in the BSC receive FIFO to the
+receive buffer.
+
+. .
+     pi: >=0 (as returned by [*pigpio_start*]).
+bscxfer: a structure defining the transfer.
+
+typedef struct
+{
+   uint32_t control;          // Write
+   int rxCnt;                 // Read only
+   char rxBuf[BSC_FIFO_SIZE]; // Read only
+   int txCnt;                 // Write
+   char txBuf[BSC_FIFO_SIZE]; // Write
+} bsc_xfer_t;
+. .
+
+To start a transfer set control (see below) and copy the bytes to
+be sent (if any) to txBuf and set the byte count in txCnt.
+
+Upon return rxCnt will be set to the number of received bytes placed
+in rxBuf.
+
+The returned function value is the status of the transfer (see below).
+
+If there was an error the status will be less than zero
+(and will contain the error code).
+
+The most significant word of the returned status contains the number
+of bytes actually copied from txBuf to the BSC transmit FIFO (may be
+less than requested if the FIFO already contained untransmitted data).
+
+Note that the control word sets the BSC mode.  The BSC will stay in
+that mode until a different control word is sent.
+
+The BSC peripheral uses GPIO 18 (SDA) and 19 (SCL) in I2C mode
+and GPIO 18 (MOSI), 19 (SCLK), 20 (MISO), and 21 (CE) in SPI mode.  You
+need to swap MISO/MOSI between master and slave.
+
+When a zero control word is received GPIO 18-21 will be reset
+to INPUT mode.
+
+control consists of the following bits.
+
+. .
+22 21 20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+ a  a  a  a  a  a  a  -  - IT HC TF IR RE TE BK EC ES PL PH I2 SP EN
+. .
+
+Bits 0-13 are copied unchanged to the BSC CR register.  See
+pages 163-165 of the Broadcom peripherals document for full
+details.
+
+aaaaaaa @ defines the I2C slave address (only relevant in I2C mode)
+IT      @ invert transmit status flags
+HC      @ enable host control
+TF      @ enable test FIFO
+IR      @ invert receive status flags
+RE      @ enable receive
+TE      @ enable transmit
+BK      @ abort operation and clear FIFOs
+EC      @ send control register as first I2C byte
+ES      @ send status register as first I2C byte
+PL      @ set SPI polarity high
+PH      @ set SPI phase high
+I2      @ enable I2C mode
+SP      @ enable SPI mode
+EN      @ enable BSC peripheral
+
+The returned status has the following format
+
+. .
+20 19 18 17 16 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+ S  S  S  S  S  R  R  R  R  R  T  T  T  T  T RB TE RF TF RE TB
+. .
+
+Bits 0-15 are copied unchanged from the BSC FR register.  See
+pages 165-166 of the Broadcom peripherals document for full
+details.
+
+SSSSS @ number of bytes successfully copied to transmit FIFO
+RRRRR @ number of bytes in receieve FIFO
+TTTTT @ number of bytes in transmit FIFO
+RB    @ receive busy
+TE    @ transmit FIFO empty
+RF    @ receive FIFO full
+TF    @ transmit FIFO full
+RE    @ receive FIFO empty
+TB    @ transmit busy
+
+The following example shows how to configure the BSC peripheral as
+an I2C slave with address 0x13 and send four bytes.
+
+...
+bsc_xfer_t xfer;
+
+xfer.control = (0x13<<16) | 0x305;
+
+memcpy(xfer.txBuf, "ABCD", 4);
+xfer.txCnt = 4;
+
+status = bsc_xfer(pi, &xfer);
+
+if (status >= 0)
+{
+   // process transfer
+}
+...
+D*/
+
+/*F*/
+int bsc_i2c(int pi, int i2c_addr, bsc_xfer_t *bscxfer);
+/*D
+This function allows the Pi to act as a slave I2C device.
+
+This function is not available on the BCM2711 (e.g.as
+used in the Pi4B).
+
+The data bytes (if any) are written to the BSC transmit
+FIFO and the bytes in the BSC receive FIFO are returned.
+
+. .
+      pi: >=0 (as returned by [*pigpio_start*]).
+i2c_addr: 0-0x7F.
+ bscxfer: a structure defining the transfer.
+
+typedef struct
+{
+   uint32_t control;          // N/A
+   int rxCnt;                 // Read only
+   char rxBuf[BSC_FIFO_SIZE]; // Read only
+   int txCnt;                 // Write
+   char txBuf[BSC_FIFO_SIZE]; // Write
+} bsc_xfer_t;
+. .
+
+txCnt is set to the number of bytes to be transmitted, possibly
+zero. The data itself should be copied to txBuf.
+
+Any received data will be written to rxBuf with rxCnt set.
+
+See [*bsc_xfer*] for details of the returned status value.
+
+If there was an error the status will be less than zero
+(and will contain the error code).
+
+Note that an i2c_address of 0 may be used to close
+the BSC device and reassign the used GPIO (18/19)
+as inputs.
+D*/
+
+/*F*/
+int event_callback(int pi, unsigned event, evtCBFunc_t f);
+/*D
+This function initialises an event callback.
+
+. .
+   pi: >=0 (as returned by [*pigpio_start*]).
+event: 0-31.
+    f: the callback function.
+. .
+
+The function returns a callback id if OK, otherwise pigif_bad_malloc,
+pigif_duplicate_callback, or pigif_bad_callback.
+
+The callback is called with the event id, and tick, whenever the
+event occurs.
+D*/
+
+/*F*/
+int event_callback_ex(int pi, unsigned event, evtCBFuncEx_t f, void *userdata);
+/*D
+This function initialises an event callback.
+
+. .
+      pi: >=0 (as returned by [*pigpio_start*]).
+   event: 0-31.
+       f: the callback function.
+userdata: a pointer to arbitrary user data.
+. .
+
+The function returns a callback id if OK, otherwise pigif_bad_malloc,
+pigif_duplicate_callback, or pigif_bad_callback.
+
+The callback is called with the event id, the tick, and the userdata
+pointer whenever the event occurs.
+D*/
+
+/*F*/
+int event_callback_cancel(unsigned callback_id);
+/*D
+This function cancels an event callback identified by its id.
+
+. .
+callback_id: >=0, as returned by a call to [*event_callback*] or
+[*event_callback_ex*].
+. .
+
+The function returns 0 if OK, otherwise pigif_callback_not_found.
+D*/
+
+/*F*/
+int wait_for_event(int pi, unsigned event, double timeout);
+/*D
+This function waits for an event for up to timeout seconds.
+
+. .
+     pi: >=0 (as returned by [*pigpio_start*]).
+  event: 0-31.
+timeout: >=0.
+. .
+
+The function returns when the event occurs or after the timeout.
+
+The function returns 1 if the event occurred, otherwise 0.
+D*/
+
+/*F*/
+int event_trigger(int pi, unsigned event);
+/*D
+This function signals the occurrence of an event.
+
+. .
+   pi: >=0 (as returned by [*pigpio_start*]).
+event: 0-31.
+. .
+
+Returns 0 if OK, otherwise PI_BAD_EVENT_ID.
+
+An event is a signal used to inform one or more consumers
+to start an action.  Each consumer which has registered an interest
+in the event (e.g. by calling [*event_callback*]) will be informed by
+a callback.
+
+One event, PI_EVENT_BSC (31) is predefined.  This event is
+auto generated on BSC slave activity.
+
+The meaning of other events is arbitrary.
+
+Note that other than its id and its tick there is no data associated
+with an event.
 D*/
 
 /*PARAMS
@@ -3159,6 +3697,22 @@ A convenient way to set bit n is to or in (1<<n).
 
 e.g. to select bits 5, 9, 23 you could use (1<<5) | (1<<9) | (1<<23).
 
+bsc_xfer_t::
+
+. .
+typedef struct
+{
+   uint32_t control;          // Write
+   int rxCnt;                 // Read only
+   char rxBuf[BSC_FIFO_SIZE]; // Read only
+   int txCnt;                 // Write
+   char txBuf[BSC_FIFO_SIZE]; // Write
+} bsc_xfer_t;
+. .
+
+*bscxfer::
+A pointer to a [*bsc_xfer_t*] object used to control a BSC transfer.
+
 *buf::
 A buffer to hold data being sent or being received.
 
@@ -3170,30 +3724,40 @@ bVal::0-255 (Hex 0x0-0xFF, Octal 0-0377)
 An 8-bit byte value.
 
 callback_id::
-A >=0, as returned by a call to [*callback*] or [*callback_ex*].  This is
-passed to [*callback_cancel*] to cancel the callback.
+A value >=0, as returned by a call to a callback function, one of
+
+[*callback*] 
+[*callback_ex*] 
+[*event_callback*] 
+[*event_callback_ex*]
+
+The id is passed to [*callback_cancel*] or [*event_callback_cancel*]
+to cancel the callback.
 
 CBFunc_t::
 . .
 typedef void (*CBFunc_t)
-   (unsigned user_gpio, unsigned level, uint32_t tick);
+   (int pi, unsigned user_gpio, unsigned level, uint32_t tick);
 . .
 
 CBFuncEx_t::
 . .
 typedef void (*CBFuncEx_t)
-   (unsigned user_gpio, unsigned level, uint32_t tick, void * user);
+   (int pi, unsigned user_gpio, unsigned level, uint32_t tick, void * userdata);
 . .
 
 char::
 A single character, an 8 bit quantity able to store 0-255.
 
-clkfreq::4689-250000000 (250M)
+clkfreq::4689-250M (13184-375M for the BCM2711)
 The hardware clock frequency.
 
 count::
 The number of bytes to be transferred in a file, I2C, SPI, or serial
 command.
+
+CS::
+The GPIO used for the slave select signal when bit banging SPI.
 
 data_bits::1-32
 The number of data bits in each character of serial data.
@@ -3225,6 +3789,24 @@ EITHER_EDGE. 2
 errnum::
 A negative number indicating a function call failed and the nature
 of the error.
+
+event::0-31
+An event is a signal used to inform one or more consumers
+to start an action.
+
+evtCBFunc_t::
+
+. .
+typedef void (*evtCBFunc_t)
+   (int pi, unsigned event, uint32_t tick);
+. .
+
+evtCBFuncEx_t::
+
+. .
+typedef void (*evtCBFuncEx_t)
+   (int pi, unsigned event, uint32_t tick, void *userdata);
+. .
 
 f::
 A function.
@@ -3276,9 +3858,9 @@ gpioPulse_t::
 . .
 typedef struct
 {
-uint32_t gpioOn;
-uint32_t gpioOff;
-uint32_t usDelay;
+   uint32_t gpioOn;
+   uint32_t gpioOff;
+   uint32_t usDelay;
 } gpioPulse_t;
 . .
 
@@ -3288,8 +3870,13 @@ typedef void *(gpioThreadFunc_t) (void *);
 . .
 
 handle::>=0
-A number referencing an object opened by one of [*file_open*],
-[*i2c_open*], [*notify_open*], [*serial_open*], and [*spi_open*].
+A number referencing an object opened by one of
+
+[*file_open*] 
+[*i2c_open*] 
+[*notify_open*] 
+[*serial_open*] 
+[*spi_open*]
 
 i2c_addr::0-0x7F
 The address of a device on the I2C bus.
@@ -3339,6 +3926,9 @@ reported as PI_TIMEOUT.  See [*set_watchdog*].
 PI_TIMEOUT 2
 . .
 
+MISO::
+The GPIO used for the MISO signal when bit banging SPI.
+
 mode::
 1. The operational mode of a GPIO, normally INPUT or OUTPUT.
 
@@ -3378,6 +3968,8 @@ PI_FILE_CREATE 8
 PI_FILE_TRUNC  16
 . .
 
+MOSI::
+The GPIO used for the MOSI signal when bit banging SPI.
 
 numBytes::
 The number of bytes used to store characters in a string.  Depending
@@ -3461,16 +4053,18 @@ The hardware PWM dutycycle.
 #define PI_HW_PWM_RANGE 1000000
 . .
 
-PWMfreq::1-125000000 (125M)
+PWMfreq::1-125M (1-187.5M for the BCM2711)
 The hardware PWM frequency.
 
 . .
 #define PI_HW_PWM_MIN_FREQ 1
 #define PI_HW_PWM_MAX_FREQ 125000000
+#define PI_HW_PWM_MAX_FREQ_2711 187500000
 . .
 
 range::25-40000
 The permissible dutycycle values are 0-range.
+
 . .
 PI_MIN_DUTYCYCLE_RANGE 25
 PI_MAX_DUTYCYCLE_RANGE 40000
@@ -3488,6 +4082,9 @@ A pointer to a buffer to receive data.
 
 SCL::
 The user GPIO to use for the clock when bit banging I2C.
+
+SCLK::
+The GPIO used for the SCLK signal when bit banging SPI.
 
 *script::
 A pointer to the text of a script.
@@ -3533,7 +4130,7 @@ spi_channel::
 A SPI channel, 0-2.
 
 spi_flags::
-See [*spi_open*].
+See [*spi_open*] and [*bb_spi_open*].
 
 steady:: 0-300000
 
@@ -3559,6 +4156,7 @@ thread.
 
 timeout::
 A GPIO watchdog timeout in milliseconds.
+
 . .
 PI_MIN_WDOG_TIMEOUT 0
 PI_MAX_WDOG_TIMEOUT 60000
@@ -3589,29 +4187,40 @@ following technique.
 
 In the calling function:
 
+. .
 user_type *userdata; 
 user_type my_userdata;
 
 userdata = malloc(sizeof(user_type)); 
 *userdata = my_userdata;
+. .
 
 In the receiving function:
 
+. .
 user_type my_userdata = *(user_type*)userdata;
 
 free(userdata);
+. .
 
 void::
 Denoting no parameter is required
 
 wave_add_*::
-One of [*wave_add_new*], [*wave_add_generic*], [*wave_add_serial*].
+One of
+
+[*wave_add_new*] 
+[*wave_add_generic*] 
+[*wave_add_serial*]
 
 wave_id::
 A number representing a waveform created by [*wave_create*].
 
 wave_send_*::
-One of [*wave_send_once*], [*wave_send_repeat*].
+One of
+
+[*wave_send_once*] 
+[*wave_send_repeat*]
 
 wVal::0-65535 (Hex 0x0-0xFFFF, Octal 0-0177777)
 A 16-bit word value.
